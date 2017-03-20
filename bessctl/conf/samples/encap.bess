@@ -1,0 +1,85 @@
+#                                                      -*- mode: python -*-
+#
+# Demonstrates bess' behaviour when the head-room is too small for
+# encapsulation.  Start as
+#
+# $ sudo bessctl daemon start -- run local/encap depth=1; echo $?
+#
+# It works with depth=[1,2] and fails with depth=3.
+
+import socket
+from struct import pack, unpack
+
+import os
+try:
+    depth = int(os.environ['depth'])
+except:
+    depth = 2
+print("depth: %d" % depth)
+
+def aton(ip):
+    a = socket.inet_aton(ip)
+    # ??? host byte oder is expeted in SetMetadata args
+    return pack('!I', *unpack('=I', a))
+
+# Byte order???
+reversed_mac_src = '\x05\x04\x03\x02\x01\x02'
+reversed_mac_dst = '\x0e\x0d\x0c\x0b\x0a\x02'
+
+v = VPort(ifname='bess', ip_addrs=['10.0.10.1/24'],
+          mac_addr='02:0a:0b:0c:0d:0e')
+
+pl = PortInc(port=v.name) -> fw::IPLookup()
+fw.add(prefix='10.0.10.0', prefix_len=24, gate=1)
+fw:0 -> Sink()
+pl = fw:1 -> Bypass()
+
+for i in range(depth):
+    src = aton('10.0.10.%d' % (depth + 1 - i))
+    dst = aton('10.0.10.%d' % (depth - i))
+    pl = (pl
+      -> SetMetadata(attrs=
+            [{'name': 'tun_ip_src', 'size': 4, 'value_bin': src},
+             {'name': 'tun_ip_dst', 'size': 4, 'value_bin': dst},
+             {'name': 'tun_id', 'size': 4, 'value_int': 900 + i}])
+      -> VXLANEncap(dstport=4789)
+      -> Update(fields=[{'offset': 0, 'size': 2, 'value': 0xffff}])
+      -> IPEncap()
+      -> SetMetadata(attrs=
+        [{'name': 'ether_src', 'size': 6, 'value_bin': reversed_mac_src},
+         {'name': 'ether_dst', 'size': 6, 'value_bin': reversed_mac_dst},
+         {'name': 'ether_type', 'size': 2, 'value_bin': pack('=H', 0x0800)}])
+      -> EtherEncap()
+    )
+pl -> PortOut(port=v.name)
+
+bess.resume_all()
+
+
+# Scapy in Debian 8.3 does not bisect vxlan packets.
+# Get scapy from here: https://github.com/p4lang/scapy-vxlan.git
+from scapy.all import *
+load_contrib('vxlan')
+# Accept any vxlan packet as answer
+VXLAN.answers = lambda self, other: True
+VXLAN.hashret = lambda self: ''
+
+# Store non-answer packets as well
+scapy.config.conf.debug_match = True
+p = srp1(Ether(dst="02:01:02:03:04:05")/
+         IP(dst='10.0.10.2', id=0)/UDP(sport=4789, dport=0xffff),
+         iface='bess', timeout=1)
+if p:
+    p.show2()
+elif scapy.sendrecv.debug.recv:
+    for pkt in scapy.sendrecv.debug.recv:
+        print(hexdump(pkt.build()))
+    p = None
+else:
+    # No packet received at all
+    pass
+
+bess.pause_all()
+bess.kill()
+
+assert p
